@@ -1,5 +1,7 @@
 #include "heapfile/HeapFile.h"
 
+#include <algorithm>
+#include <filesystem>
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -165,13 +167,17 @@ HeapFile::HeapFile(bufman::BufferManager& manager) : manager_(manager) {}
 
 bool HeapFile::is_open() const {
     // TODO(student): report whether a file is currently open.
-    return false;
+    return open_;
 }
 
 bool HeapFile::require_open(std::string& error) const {
     // TODO(student): fail with "heap file is not open" when closed.
-    (void)error;
-    return false;
+    error.clear();
+    if (!open_) {
+        error = "heap file is not open";
+        return false;
+    }
+    return true;
 }
 
 bool HeapFile::create(const std::string& path,
@@ -180,10 +186,60 @@ bool HeapFile::create(const std::string& path,
     // non-empty path, validate the record size, alloc page 0, format it as
     // a SlottedPage, write the identification record, and close (flushing)
     // the file — leaving this HeapFile closed.
-    (void)path;
-    (void)schema;
-    (void)error;
-    return false;
+
+    error.clear();
+    if (open_) {
+        error = "heap file is already open";
+        return false;
+    }
+    std::error_code fs_error;
+    if (std::filesystem::exists(path, fs_error) && std::filesystem::file_size(path, fs_error) > 0) {
+        error = "heap file \"" + path + "\": already exists";
+        return false;
+    }
+    const schema ::TupleSerializer serializer(schema);
+    const std::size_t record_size = serializer.record_size();
+    if (record_size == 0) {
+        error="schema has no record layout";
+        return false;
+    }
+    if(record_size >= kSlotCountOffset || slot_capacity(record_size) == 0) {
+        error="record size " + std::to_string(record_size) + " does not fit a page";
+        return false;
+    }
+    if(schema.table_name().size() > kMaxTableNameLength) {
+        error="table name is too long for the header";
+        return false;   
+    }
+    if (!manager_.open_file(path, file_, error)) {
+        file_ = bufman::File{};
+        return false;
+    }
+    std::size_t frame=0;
+    if(!manager_.alloc_page(file_, 0, frame, error)) {
+        std::string close_error;
+        manager_.close_file(file_, close_error);
+        file_ = bufman::File{};
+        return false;
+    }
+
+    char* buffer = manager_.frame(frame).buffer;
+    SlottedPage header;
+    header.bind(buffer, record_size);
+    header.format();
+    if(!write_identification(buffer, schema, error)) {
+        release(manager_, frame, false);
+        std::string close_error;
+        manager_.close_file(file_, close_error);
+        file_ = bufman::File{};
+        return false;
+    }
+    if(!manager_.unpin(frame,true, error)){
+        return false;
+    }
+    const bool close = manager_.close_file(file_, error);
+    file_ = bufman::File{};
+  
 }
 
 bool HeapFile::open(const std::string& path,
@@ -193,18 +249,182 @@ bool HeapFile::open(const std::string& path,
     // and the header fields in range. On any failure unwind completely
     // (close through the manager, reset the handle) and return false; on
     // success bind schema_/serializer_/record_size_ and mark the file open.
-    (void)path;
-    (void)schema;
-    (void)error;
-    return false;
+    error.clear();
+    if (open_) {
+        error = "heap file is already open";
+        return false;
+    }
+    std::error_code fs_error;
+    if (!std::filesystem::exists(path, fs_error)) {
+        error = "heap file \"" + path + "\": does not exist";
+        return false;
+    }
+    const schema::TupleSerializer serializer(schema);
+    const std::size_t record_size = serializer.record_size();
+    if (record_size == 0) {
+        error = "schema has no record layout";
+        return false;
+    }
+    if(!manager_.open_file(path, file_, error)) {
+        file_ = bufman::File{};
+        return false;
+    }
+    auto unwind = [&]() {
+        std::string close_error;
+        manager_.close_file(file_, close_error);
+        file_ = bufman::File{};
+    };
+    std::size_t frame=0;
+    if(!manager_.pin(file_, 0, frame, error)) {
+        unwind();
+        return false;
+    }
+    char* buffer = manager_.frame(frame).buffer;
+    bool ok= check_identification(buffer, schema, error);
+    if(!ok) {
+        SlottedPage header;
+        header.bind(buffer, record_size);
+        ok = header.attach(error);
+    }
+    if(ok) {
+        const HeaderFields fields = read_header_fields(buffer);
+        const std::uint64_t blocks = bufman::block_count(file_, error);
+        ok = error.empty() && header_fields_in_range(fields, blocks, error);
+    }
+    if(!ok) {
+        release(manager_, frame, false);
+        unwind();
+        return false;
+    }
+    if(!manager_.unpin(frame, false, error)) {
+        unwind();
+        return false;
+    }
+    schema_ = &schema;
+    serializer_.emplace(schema);
+    record_size_ = record_size;
+    open_ = true;
+    return true;
+   
+}
+bool HeapFile::close(std::string& error) {
+    error.clear();
+    if(!require_open(error)) {
+        return false;
+    }
+    if(!manager_.close_file(file_, error)) {
+        return false;
+    }
+    file_ = bufman::File{};
+    schema_ = nullptr;
+    serializer_.reset();
+    record_size_ = 0;
+    open_ = false;
+    return true;
 }
 
 HeapFileIterator HeapFile::scan() {
     // TODO(student): pin the header once, read the two list heads and
     // next_page_id, unpin, and return an iterator seeded with them. A
     // closed file yields an exhausted iterator.
-    return HeapFileIterator(*this, kNoPage, kNoPage, 1);
+    if(!open_) {
+        return HeapFileIterator(*this, kNoPage, kNoPage, 1);
+    }
+    std::string error;
+    std::size_t frame=0;
+    if(!manager_.pin(file_, 0, frame, error)) {
+        HeapFileIterator failed(*this, kNoPage, kNoPage, 1);
+        failed.iterating_=0;
+        failed.seen_.assign(error.begin(), error.end());
+        return failed;
+    }
+    const HeaderFields fields = read_header_fields(manager_.frame(frame).buffer);
+    release(manager_, frame, false);
+    return HeapFileIterator(*this, fields.free_head, fields.full_head, fields.next_page_id);
 }
+bool HeapFileIterator ::next(tuple::Tuple& tuple, std::string& error) {
+    // TODO(student): walk the free list's pages, then the full list's, in
+    // list order; on each page scan slots in order and yield every
+    // occupied slot's decoded record, remembering the slot to resume from.
+    // Exhaustion is false with an EMPTY error; a revisited page
+    // (cyclic lists) is false with a named error. The iterator owns the pin
+    // on the current page; unpin it before moving to the next page.
+    error.clear();
+    if(iterating_ == 0) {
+        error.assign(seen_.begin(), seen_.end());
+        return false;
+    }
+    auto fail = [&](){
+        iterating_ = 0;
+        seen_.assign(error.begin(), error.end());
+        return false;
+    };
+    if(!file_->require_open(error)) {
+        return fail();
+    }
+    bufman::BufferManager& manager = file_->manager_;
+    while(true){
+        if(page_id_ == kNoPage) {
+            if(next_list_ == kNoPage) {
+                return false;
+            }
+            page_id_ = next_list_;
+            next_list_ = kNoPage;
+            slot_ = 0;
+            continue;
+        }
+        if(iterating_ == page_id_) {
+            if(page_id_ ==0 || page_id_ >= seen_.size()) {
+             error="scan returned to page " + std::to_string(page_id_) + " outside the allocated pages";
+             return fail();
+        }
+        if(seen_[page_id_]) {
+            error="scan revisited page " + std::to_string(page_id_) + " :cyclic lists";
+            return fail();
+        }
+        iterating_ = page_id_;
+        slot_ = 0;
+        }
+    std::size_t frame=0;
+    if(!manager.pin(file_->file_, page_id_, frame, error)) {
+        return fail();
+    }
+    SlottedPage page;
+    page.bind(manager.frame(frame).buffer, file_->record_size_);
+    if(!page.attach(error)) {
+        release(manager, frame, false);
+        return fail();
+    }
+    while (slot_<page.capacity()) {
+        const std::uint16_t slot = slot_;
+        std::string slot_error;
+
+        if(!page.is_occupied(slot_, slot_error)) {
+            ++slot_;
+            continue;
+        }
+        std::vector<char> record(file_->record_size_);
+        if(!page.get_record(slot_, record.data(), record.size(), error)) {
+            release(manager, frame, false);
+            return fail();
+        }
+        release(manager, frame, false);
+        if(!file_->serializer_->deserialize(record.data(), record.size(), tuple, error)) {
+            return fail();
+        }
+        slot_ =slot_ + 1;
+        current_ = RowId{page_id_, slot};
+        return true;
+    }
+    const std::uint32_t forward = page.next_page();
+    release(manager, frame, false);
+    seen_[page_id_] = 1;
+    iterating_ = kNoPage;
+    page_id_ = forward;
+    slot_ = 0;
+}
+}
+
 
 // --- List surgery -----------------------------------------------------------
 
@@ -213,34 +433,14 @@ bool HeapFile::append_fresh_page(std::uint32_t page_id, std::size_t page_frame, 
     // element (head and tail) and advance next_page_id past it; clear the
     // page's own links. Only called right after an allocation, when the
     // free list is empty by construction — refuse otherwise.
-    // (void)page_id;
-    // (void)page_frame;
-    // (void)error;
-    // return false;
-    error.clear();
-    std::size_t header_frame = 0;
-    if (!manager_.pin(file_, 0, header_frame, error)) {
-        return false;
-    }
-    char* header = manager_.frame(header_frame).buffer;
-    HeaderFields fields = read_header_fields(header);
-    if (fields.free_head != kNoPage || fields.free_tail != kNoPage) {
-        error = "append_fresh_page called when free list is not empty";
-        release(manager_, header_frame, false);
-        return false;
-    }
-
-    char* page = manager_.frame(page_frame).buffer;
-    page_detail::write_u32(page, kPrevPageIdOffset, kNoPage);
-    page_detail::write_u32(page, kNextPageIdOffset, kNoPage);
-    fields.free_head = page_id;
-    fields.free_tail = page_id;
-    fields.next_page_id = page_id + 1;
-    write_header_fields(page, fields);
-    return manager_.unpin(header_frame, true, error);
+    (void)page_id;
+    (void)page_frame;
+    (void)error;
+    return false;
 }
 
-bool HeapFile::move_between_lists(bool to_full, std::uint32_t page_id, std::size_t page_frame, std::string& error) {
+bool HeapFile::move_between_lists(bool to_full, std::uint32_t page_id,
+                                  std::size_t page_frame, std::string& error) {
     // TODO(student): detach the pinned page from its source list (its
     // prev/next name the source neighbors) and append it at the
     // destination list's tail. Acquire ALL auxiliary pins first (header +
@@ -562,8 +762,102 @@ bool HeapFile::check_structure(std::string& error) {
     // every allocated page reachable exactly once, membership matches
     // occupancy, page 0 on no list, the union covering exactly pages
     // 1..next_page_id-1, and every on-disk data page reachable.
-    (void)error;
-    return false;
+    error.clear();
+    if(!require_open(error)) {
+        return false;
+    }
+    std::size_t header_frame=0;
+    if(!manager_.pin(file_, 0, header_frame, error)) {
+        return false;
+    }
+
+    const HeaderFields fields = read_header_fields(manager_.frame(header_frame).buffer);
+    release(manager_, header_frame, false);
+
+    const std::uint64_t blocks = bufman::block_count(file_, error);
+    if(!error.empty()) {
+        return false;
+    }
+
+    if(!header_fields_in_range(fields, blocks, error)) {
+        return false;
+    }
+
+    std::vector<char> seen(fields.next_page_id, 0);
+
+    auto walk =[&](bool free_list, std::uint32_t head, std::uint32_t tail) -> bool {
+        const std::string name = free_list ? "free list" : "full list";
+        if((head == kNoPage )!= (tail == kNoPage)) {
+            error = name + " head and tail disagree on emptiness";
+            return false;
+        }
+        std::uint32_t prev = kNoPage;
+        std::uint32_t current = head;
+        while (current !=kNoPage){
+           if(current ==0){
+            error= name+ ": the header page appears on the list";
+                return false;
+           }
+           if(current>= fields.next_page_id){
+            error = name + ": page "+ std::to_string(current)+ "is beyond the allocated pages";
+                return false;
+           }
+           if (seen[current]) {
+            error = name + ": page " + std::to_string(current) + " visited twice (cyclic list or page on both lists)";
+                 return false;
+            }
+            seen[current]=1;
+            std::size_t frame=0;
+            if(!manager_.pin(file_, current, frame, error)) {
+                return false;
+            }
+            SlottedPage page;
+            page.bind(manager_.frame(frame).buffer, record_size_);
+            if (!page.attach(error)) {
+                release(manager_, frame, false);
+                return false;
+            }
+            const std::uint32_t back = page.prev_page();
+            const std::uint32_t forward = page.next_page();
+            const bool full = page.occupied_count() == page.capacity();
+            release(manager_, frame, false);
+            if (back != prev) {
+                error = name + ": page " + std::to_string(current) +
+                        " has a broken prev link";
+                return false;
+            }
+            if (full == free_list) {
+                error = name + ": page " + std::to_string(current) +
+                        (full ? " is full" : " has a free slot") +
+                        " and contradicts its list";
+                return false;
+            }
+            prev = current;
+            current = forward;
+        }
+        if (prev != tail) {
+            error = name + ": tail pointer disagrees with the walk";
+            return false;
+        }
+        return true;
+    };
+
+    if (!walk(true, fields.free_head, fields.free_tail) ||
+        !walk(false, fields.full_head, fields.full_tail)) {
+        return false;
+    }
+    for (std::uint32_t id = 1; id < fields.next_page_id; ++id) {
+        if (!seen[id]) {
+            error = "page " + std::to_string(id) + " is on no list";
+            return false;
+        }
+    }
+    if (blocks > fields.next_page_id) {
+        error = "on-disk page " + std::to_string(fields.next_page_id) +
+                " is unreachable from the lists";
+        return false;
+    }
+    return true;
 }
 
 // --- Lifecycle --------------------------------------------------------------
